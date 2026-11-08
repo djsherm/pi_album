@@ -58,6 +58,11 @@ JARCHIVE_URL = "https://j-archive.com/"
 JEOPARDY_FILES = ("recent.jpg", "random.jpg", "recent_answer.jpg", "random_answer.jpg")
 STATE_FILE = os.path.join(JEOPARDY_PATH, "scrape_state.json")
 
+# Master switch. While False, the script never contacts j-archive at all (not even a
+# connectivity check); buttons B and C still show any cached clue images. FRAME_FORCE_SCRAPE
+# does not override this. Set to True only if the site's operators are OK with it.
+SCRAPE_ENABLED = False
+
 # Be gentle with the site: scrape at most once per REFRESH_INTERVAL, and back off
 # after failures (6h, 12h, 24h, then 48h) instead of retrying on every restart.
 # Set FRAME_FORCE_SCRAPE=1 to bypass the limits for one run (for testing).
@@ -656,6 +661,10 @@ def refresh_jeopardy(force: bool = False) -> None:
     Scrapes into a temp folder and only replaces the existing images on success,
     so a failed scrape never leaves the frame without a clue to show.
     """
+    if not SCRAPE_ENABLED:
+        log.info("Jeopardy scraping is disabled (SCRAPE_ENABLED = False); not contacting j-archive. "
+                 "Using cached clue images if any.")
+        return
     force = force or bool(os.environ.get("FRAME_FORCE_SCRAPE"))
     state = _load_state()
     due, reason = scrape_due(state)
