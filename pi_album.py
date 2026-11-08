@@ -17,12 +17,14 @@ Logging:
 """
 
 import io
+import json
 import logging
 import logging.handlers
 import os
 import random
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -30,10 +32,11 @@ import threading
 import time
 from contextlib import contextmanager
 from typing import Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 import RPi.GPIO as GPIO
 from inky.auto import auto
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.chrome.options import Options
@@ -51,8 +54,17 @@ JEOPARDY_PATH = os.path.join(PATH, "jeopardy")
 PHOTO_ALBUM = os.path.join(PATH, 'album')
 LOG_FILE = os.path.join(PATH, 'frame.log')
 
-JARCHIVE_URL = "https://www.j-archive.com/"
+JARCHIVE_URL = "https://j-archive.com/"
 JEOPARDY_FILES = ("recent.jpg", "random.jpg", "recent_answer.jpg", "random_answer.jpg")
+STATE_FILE = os.path.join(JEOPARDY_PATH, "scrape_state.json")
+
+# Be gentle with the site: scrape at most once per REFRESH_INTERVAL, and back off
+# after failures (6h, 12h, 24h, then 48h) instead of retrying on every restart.
+# Set FRAME_FORCE_SCRAPE=1 to bypass the limits for one run (for testing).
+REFRESH_INTERVAL = 24 * 3600
+BACKOFF_BASE = 6 * 3600
+BACKOFF_MAX = 48 * 3600
+PREFLIGHT_TIMEOUT = 10      # seconds for the quick TCP check before launching Chromium
 
 CANVAS_SIZE = (640, 400)
 JPEG_QUALITY = 90
@@ -375,24 +387,58 @@ def save_jarchive_questions_and_answers(
                 driver.execute_script("return document.readyState"),
             )
 
-        set_stage("wait for table.final_round")
+        set_stage("wait for clue tables")
         wait = WebDriverWait(driver, wait_seconds)
-        with step(f"Wait up to {wait_seconds}s for table.final_round"):
+        with step(f"Wait up to {wait_seconds}s for a clue table"):
             try:
-                wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table.final_round")))
+                wait.until(EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, "table.final_round, td.clue_text, td.category_name")))
             except TimeoutException:
-                log.warning("table.final_round did not appear within %ss; continuing best-effort", wait_seconds)
+                log.warning("No clue table appeared within %ss; continuing best-effort", wait_seconds)
 
         set_stage("find tables")
-        tables = driver.find_elements(By.CSS_SELECTOR, "table.final_round")
-        log.info("Found %d table.final_round element(s)", len(tables))
+        # Try several strategies, most specific first. The later ones key off the
+        # cells the rest of the code already relies on (td.clue_text / td.category_name),
+        # so they still work if the table's own class name has changed.
+        strategies = [
+            ("css table.final_round", By.CSS_SELECTOR, "table.final_round"),
+            ("xpath table containing td.clue_text", By.XPATH,
+             "//td[contains(concat(' ', normalize-space(@class), ' '), ' clue_text ')]/ancestor::table[1]"),
+            ("xpath table containing td.category_name", By.XPATH,
+             "//td[contains(concat(' ', normalize-space(@class), ' '), ' category_name ')]/ancestor::table[1]"),
+        ]
+        tables = []
+        for label, by, selector in strategies:
+            found = driver.find_elements(by, selector)
+            unique, seen = [], set()
+            for el in found:
+                if el.id not in seen:
+                    seen.add(el.id)
+                    unique.append(el)
+            log.info("Strategy %-40s -> %d table(s)", label, len(unique))
+            if unique:
+                tables = unique
+                break
+
         if not tables:
             all_tables = driver.find_elements(By.TAG_NAME, "table")
-            log.error("Page has %d <table> elements in total; first few classes:", len(all_tables))
-            for i, t in enumerate(all_tables[:10]):
+            log.error("No clue tables found. title=%r url=%s", driver.title, driver.current_url)
+            log.error("Page has %d <table>, %d <iframe>, %d td.clue_text, %d td.category_name",
+                      len(all_tables),
+                      len(driver.find_elements(By.TAG_NAME, "iframe")),
+                      len(driver.find_elements(By.CSS_SELECTOR, "td.clue_text")),
+                      len(driver.find_elements(By.CSS_SELECTOR, "td.category_name")))
+            for i, t in enumerate(all_tables[:15]):
                 log.error("  table[%d] class=%r id=%r", i, t.get_attribute("class"), t.get_attribute("id"))
+            try:
+                body_text = driver.find_element(By.TAG_NAME, "body").text
+                log.error("Visible page text (first 600 chars): %r", body_text[:600])
+            except Exception:
+                log.exception("Could not read page body text")
             _dump_debug(driver, debug_dir)
-            raise Exception("No 'table.final_round' elements found on the page")
+            raise Exception(
+                "No clue tables found on the page (see debug_page.html / debug_page.png in "
+                f"{debug_dir})")
 
         def extract_meta_from_table(elem) -> Dict[str, str]:
             cat = ""
@@ -519,37 +565,150 @@ def save_jarchive_questions_and_answers(
             _kill_browser_processes(service, "driver never started")
 
 
-def refresh_jeopardy() -> None:
+def _fmt_age(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes = rem // 60
+    return f"{hours}h {minutes}m" if hours else f"{minutes}m"
+
+
+def _load_state() -> Dict[str, float]:
+    state = {"last_success": 0.0, "last_attempt": 0.0, "failures": 0}
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        state["last_success"] = float(data.get("last_success", 0))
+        state["last_attempt"] = float(data.get("last_attempt", 0))
+        state["failures"] = int(data.get("failures", 0))
+    except FileNotFoundError:
+        log.debug("No scrape state file yet (%s)", STATE_FILE)
+    except Exception:
+        log.warning("Could not read %s; starting with fresh state", STATE_FILE, exc_info=True)
+    return state
+
+
+def _save_state(state: Dict[str, float]) -> None:
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(tmp, STATE_FILE)
+        log.debug("Saved scrape state: %s", state)
+    except Exception:
+        log.exception("Could not save scrape state to %s", STATE_FILE)
+
+
+def _have_cached_images() -> bool:
+    return all(os.path.isfile(os.path.join(JEOPARDY_PATH, n)) for n in JEOPARDY_FILES)
+
+
+def scrape_due(state: Dict[str, float]) -> Tuple[bool, str]:
+    """Decide whether a scrape is allowed right now. Returns (due, human-readable reason)."""
+    now = time.time()
+    have_images = _have_cached_images()
+    last_success = state["last_success"]
+    if have_images and not last_success:
+        # Images that predate the state file: trust their timestamp.
+        try:
+            last_success = os.path.getmtime(os.path.join(JEOPARDY_PATH, "random.jpg"))
+        except OSError:
+            pass
+
+    if have_images and last_success and now - last_success < REFRESH_INTERVAL:
+        return False, (f"cached clues are only {_fmt_age(now - last_success)} old "
+                       f"(refreshing every {_fmt_age(REFRESH_INTERVAL)})")
+
+    if state["failures"] > 0 and state["last_attempt"]:
+        wait = min(BACKOFF_BASE * 2 ** (state["failures"] - 1), BACKOFF_MAX)
+        since = now - state["last_attempt"]
+        if since < wait:
+            return False, (f"last attempt was {_fmt_age(since)} ago and {state['failures']} "
+                           f"attempt(s) in a row have not succeeded; backing off for another "
+                           f"{_fmt_age(wait - since)}")
+
+    if not have_images:
+        return True, "no cached clues yet"
+    if last_success:
+        return True, f"cached clues are {_fmt_age(now - last_success)} old"
+    return True, "cached clues have unknown age"
+
+
+def _site_reachable() -> bool:
+    """Cheap TCP check so we don't launch Chromium (and wait ~minutes) when the site is unreachable."""
+    host = urlparse(JARCHIVE_URL).hostname
+    try:
+        with socket.create_connection((host, 443), timeout=PREFLIGHT_TIMEOUT):
+            pass
+        log.info("Preflight OK: TCP connection to %s:443 succeeded", host)
+        return True
+    except OSError as e:
+        log.error(
+            "Preflight FAILED: could not connect to %s:443 within %ss (%s). "
+            "The site is unreachable from this network (blocked, down, or a routing problem).",
+            host, PREFLIGHT_TIMEOUT, e)
+        return False
+
+
+def refresh_jeopardy(force: bool = False) -> None:
     """
-    Scrape into a temp folder and only replace the existing images on success,
+    Scrape at most once per REFRESH_INTERVAL (with backoff after failures).
+    Scrapes into a temp folder and only replaces the existing images on success,
     so a failed scrape never leaves the frame without a clue to show.
     """
-    log.info("=== Jeopardy refresh starting ===")
+    force = force or bool(os.environ.get("FRAME_FORCE_SCRAPE"))
+    state = _load_state()
+    due, reason = scrape_due(state)
+    if not due and not force:
+        log.info("Skipping Jeopardy scrape: %s", reason)
+        return
+    if not due and force:
+        log.warning("FRAME_FORCE_SCRAPE set; ignoring limit (%s)", reason)
+
+    log.info("=== Jeopardy refresh starting (%s) ===", reason)
+    # Record the attempt up front and count it as a failure until it succeeds, so a
+    # crash, kill or power cut mid-scrape can't cause a scrape on every restart.
+    state["last_attempt"] = time.time()
+    state["failures"] += 1
+    _save_state(state)
+
     scrape_running.set()
     t0 = time.monotonic()
     tmp_dir = None
     try:
         os.makedirs(JEOPARDY_PATH, exist_ok=True)
+        if not _site_reachable():
+            raise ConnectionError(f"{JARCHIVE_URL} is unreachable from this network")
         tmp_dir = tempfile.mkdtemp(prefix=".scrape_", dir=JEOPARDY_PATH)
         log.debug("Scraping into temp dir %s", tmp_dir)
 
         (_, recent_meta), (_, random_meta) = save_jarchive_questions_and_answers(
             tmp_dir, debug_dir=JEOPARDY_PATH)
 
+        # Only touch the existing images once ALL four new ones exist and are non-empty,
+        # so a partial scrape can never replace a good set with a mixed one.
         for name in JEOPARDY_FILES:
             src = os.path.join(tmp_dir, name)
+            if not os.path.isfile(src) or os.path.getsize(src) == 0:
+                raise FileNotFoundError(f"Scraper did not produce a valid {src}; keeping old images")
+        for name in JEOPARDY_FILES:
             dst = os.path.join(JEOPARDY_PATH, name)
-            if not os.path.isfile(src):
-                raise FileNotFoundError(f"Scraper did not produce {src}")
-            os.replace(src, dst)
+            os.replace(os.path.join(tmp_dir, name), dst)
             log.info("Installed %s", dst)
 
+        state["last_success"] = time.time()
+        state["failures"] = 0
+        _save_state(state)
         log.info("Recent clue: %s", recent_meta)
         log.info("Random clue: %s", random_meta)
         log.info("=== Jeopardy refresh complete (%.1fs) ===", time.monotonic() - t0)
     except Exception:
+        wait = min(BACKOFF_BASE * 2 ** (state["failures"] - 1), BACKOFF_MAX)
         log.exception("=== Jeopardy refresh FAILED after %.1fs; keeping any previous images ===",
                       time.monotonic() - t0)
+        log.error("Failure #%d in a row. No further attempt for at least %s (until about %s).",
+                  state["failures"], _fmt_age(wait),
+                  time.strftime("%Y-%m-%d %H:%M", time.localtime(time.time() + wait)))
     finally:
         scrape_running.clear()
         if tmp_dir:
@@ -559,6 +718,53 @@ def refresh_jeopardy() -> None:
 """
 DISPLAY
 """
+
+
+def _fmt_stale(seconds: float) -> str:
+    hours = max(0, int(seconds)) // 3600
+    if hours < 1:
+        return "<1h old"
+    if hours < 48:
+        return f"{hours}h old"
+    return f"{hours // 24}d old"
+
+
+def _load_font(size: int):
+    for font_path in ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                      "/usr/share/fonts/truetype/freefont/FreeSans.ttf"):
+        try:
+            return ImageFont.truetype(font_path, size)
+        except OSError:
+            continue
+    try:
+        return ImageFont.load_default(size=size)  # newer Pillow
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _stamp_age(image: Image.Image, path: str) -> Image.Image:
+    """
+    Return a copy of `image` with a small "Scraped <date> - <age>" label in the
+    bottom-right corner, based on when the file was saved. The file on disk is not changed.
+    """
+    try:
+        mtime = os.path.getmtime(path)
+        text = (f"Scraped {time.strftime('%Y-%m-%d', time.localtime(mtime))} - "
+                f"{_fmt_stale(time.time() - mtime)}")
+        img = image.convert("RGB")
+        draw = ImageDraw.Draw(img)
+        font = _load_font(13)
+        left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+        w, h = right - left, bottom - top
+        pad = 3
+        x1, y1 = img.width - (w + 2 * pad) - 1, img.height - (h + 2 * pad) - 1
+        draw.rectangle([x1, y1, img.width - 1, img.height - 1], fill=(255, 255, 255), outline=(0, 0, 0))
+        draw.text((x1 + pad - left, y1 + pad - top), text, font=font, fill=(0, 0, 0))
+        log.debug("Stamped image with %r", text)
+        return img
+    except Exception:
+        log.exception("Could not stamp age on %s; showing it unmodified", path)
+        return image
 
 
 def _push_to_display(inky, image: Image.Image, label: str) -> bool:
@@ -605,13 +811,16 @@ def Show_Image_On_Pimoroni(inky, path):
         if scrape_running.is_set():
             log.warning("%s not ready yet: Jeopardy scrape is still running", path)
         else:
-            log.warning("%s does not exist (scrape failed? see log above)", path)
+            log.warning("No cached Jeopardy clue yet (%s missing). The last scrape failed or "
+                        "was skipped; see the log lines at startup.", path)
         return
+    log.info("Showing cached %s (scraped %s ago)", os.path.basename(path),
+             _fmt_age(time.time() - os.path.getmtime(path)))
     with Image.open(path) as image:
         if image.size != tuple(inky.resolution):
             log.debug("Resizing %s from %s to %s", path, image.size, inky.resolution)
             image = image.resize(inky.resolution)
-        _push_to_display(inky, image, os.path.basename(path))
+        _push_to_display(inky, _stamp_age(image, path), os.path.basename(path))
 
 
 # "handle_button" is called every time a button is pressed.
